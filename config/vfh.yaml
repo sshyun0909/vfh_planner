@@ -1,0 +1,21 @@
+vfh_node:
+  ros__parameters:
+    golbal_frame: "map"
+    robot_frame: "base_footprint"
+    robot_bubble: 10.0
+
+    max_velocity: 0.2
+    min_velocity: 0.0
+    max_yawrate: 0.2
+
+    dist_goal_th_: 0.1
+    angle_goal_th: 0.25
+    obstacle_th: 1.25
+    emergency_th: 0.55
+
+    sub_goal_distance: 1.5
+    safety_distance: 2.5
+
+    goal_point_x: 1.0
+    goal_point_y: -2.0
+    goal_point_yaw: 0.0
