@@ -1,4 +1,4 @@
-/** <Copyright <sshyun0909 */
+/* <Copyright <sshyun0909> */
 
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/laser_scan.hpp>
@@ -34,7 +34,7 @@ public:
     this->declare_parameter<double>("angle_goal_th", 0.02);
     this->declare_parameter<double>("obstacle_th", 1.25);
     this->declare_parameter<double>("emergency_th", 0.6);
-    this->declare_parameter<double>("sub_goal_distance", 1.5);
+    this->declare_parameter<double>("sub_goal_th", 1.5);
     this->declare_parameter<double>("safety_distance", 2.0);
     this->declare_parameter<double>("goal_point_x", 0.0);
     this->declare_parameter<double>("goal_point_y", 0.0);
@@ -50,7 +50,7 @@ public:
     this->get_parameter("angle_goal_th", angle_goal_th_);
     this->get_parameter("obstacle_th", obstacle_th_);
     this->get_parameter("emergency_th", emergency_th_);
-    this->get_parameter("sub_goal_distance", sub_goal_distance_);
+    this->get_parameter("sub_goal_th", sub_goal_th_);
     this->get_parameter("safety_distance", safety_distance_);
     this->get_parameter("goal_point_x", goal_.pose.position.x);
     this->get_parameter("goal_point_y", goal_.pose.position.y);
@@ -61,8 +61,7 @@ public:
     goal_.pose.orientation = tf2::toMsg(q);
 
     velocity_pub_ = this->create_publisher<geometry_msgs::msg::Twist>("/cmd_vel", 10);
-    scan_sub_ =
-      this->create_subscription<sensor_msgs::msg::LaserScan>(
+    scan_sub_ = this->create_subscription<sensor_msgs::msg::LaserScan>(
       "/scan", 10,
       std::bind(&VFH::scan_callback, this, std::placeholders::_1));
     tf_buffer_ = std::make_shared<tf2_ros::Buffer>(this->get_clock());
@@ -71,7 +70,7 @@ public:
 
   void process()
   {
-    rclcpp::Rate loop_rate(10);
+    rclcpp::Rate loop_rate(20);
     while (rclcpp::ok()) {
       geometry_msgs::msg::Twist cmd_vel;
 
@@ -91,16 +90,20 @@ public:
           }
         }
 
-        if (!sub_goal_reached_) {
-          cmd_vel = vfh_velocity();
+        if (!emergency_break()) {
+          if (!sub_goal_reached_) {
+            cmd_vel = vfh_velocity();
+          } else {
+            cmd_vel = move_robot();
+          }
         } else {
-          cmd_vel = move_robot();
+          cmd_vel.linear.x = min_velocity_;
+          cmd_vel.angular.z = 0.0;
         }
         velocity_pub_->publish(cmd_vel);
       } else {
         RCLCPP_WARN(this->get_logger(), "Failed to update scan data");
       }
-
       rclcpp::spin_some(this->shared_from_this());
       loop_rate.sleep();
     }
@@ -111,9 +114,8 @@ public:
     try {
       geometry_msgs::msg::TransformStamped transform_stamped;
       transform_stamped = tf_buffer_->lookupTransform(
-        goal_.header.frame_id, robot_frame_,
-        tf2::TimePointZero);  // tf2 버퍼를 사용하여 두 프레임간 변환을 찾음
-      tf2::fromMsg(transform_stamped.transform, robot_transform_);  // geometry_msg -> tf2
+        goal_.header.frame_id, robot_frame_, tf2::TimePointZero);
+      tf2::fromMsg(transform_stamped.transform, robot_transform_);
 
       robot_x_ = robot_transform_.getOrigin().x();
       robot_y_ = robot_transform_.getOrigin().y();
@@ -139,17 +141,26 @@ public:
 
   bool obstacle_detection()
   {
+    geometry_msgs::msg::Twist cmd_vel;
     for (size_t i = 0; i < scan_msg_->ranges.size(); ++i) {
       double angle = scan_msg_->angle_min + i * scan_msg_->angle_increment;
       double angle_deg = angle * 180.0 / M_PI;
 
       if ((angle_deg >= -180 && angle_deg <= -90) || (angle_deg >= 90 && angle_deg <= 180)) {
         if (scan_msg_->ranges[i] < obstacle_th_) {
-          // RCLCPP_INFO(
-          //   this->get_logger(), "%.3fm, Obstacle Detected at angle %.3f degrees",
-          //   scan_msg_->ranges[i], angle_deg);
           return true;
         }
+      }
+    }
+    return false;
+  }
+
+  bool emergency_break()
+  {
+    for (size_t i = 0; i < scan_msg_->ranges.size(); ++i) {
+      if (scan_msg_->ranges[i] < emergency_th_) {
+        RCLCPP_WARN(this->get_logger(), "Emergency stop! Obstacle detected within threshold.");
+        return true;
       }
     }
     return false;
@@ -171,7 +182,7 @@ public:
       RCLCPP_INFO(
         this->get_logger(), "Align velocity: speed: %.3f, angular: %.3f", cmd_vel.linear.x,
         cmd_vel.angular.z);
-      if (yaw_error_ < angle_goal_th_) {
+      if (std::abs(yaw_error_) < angle_goal_th_) {
         robot_aligned_ = true;
       }
     } else if (robot_aligned_ && robot_reached_) {
@@ -191,68 +202,35 @@ public:
   geometry_msgs::msg::Twist vfh_velocity()
   {
     geometry_msgs::msg::Twist cmd_vel;
-    for (size_t i = 0; i < scan_msg_->ranges.size(); ++i) {
-      if (scan_msg_->ranges[i] < emergency_th_) {
-        cmd_vel.linear.x = 0;
-        cmd_vel.angular.z = 0;
-        RCLCPP_WARN(this->get_logger(), "Emergency stop! Obstacle detected within threshold.");
-        return cmd_vel;
-      }
-    }
-
     sub_yaw_error_ = update_sub_pose();
 
-    double rotation_time = sub_goal_angle_ / max_yawrate_;
-    if (best_index_ == left_index_) {
-      cmd_vel.linear.x = 0;
-      cmd_vel.angular.z = max_yawrate_;
-    } else if (best_index_ == right_index_) {
-      cmd_vel.linear.x = 0;
-      cmd_vel.angular.z = max_yawrate_;
-    }
-    velocity_pub_->publish(cmd_vel);
-    rclcpp::sleep_for(std::chrono::milliseconds(static_cast<int>(rotation_time * 1000)));
-
-    cmd_vel.linear.x = max_velocity_;
-    cmd_vel.angular.z = 0.0;
-    RCLCPP_INFO(
-      this->get_logger(), "Align VFH velocity: speed: %.3f, angular: %.3f", cmd_vel.linear.x,
-      cmd_vel.angular.z);
-
-    if (!sub_goal_reached_) {
-      cmd_vel.linear.x = max_velocity_;
+    if (std::abs(sub_yaw_error_) > angle_goal_th_) {
+      if (best_index_ == left_index_) {
+        cmd_vel.linear.x = 0.0;
+        cmd_vel.angular.z = std::min(sub_yaw_error_, max_yawrate_);
+        RCLCPP_INFO(
+          this->get_logger(), "Align Left VFH velocity: speed: %.3f, angular: %.3f",
+          cmd_vel.linear.x, cmd_vel.angular.z);
+      } else if (best_index_ == right_index_) {
+        cmd_vel.linear.x = 0.0;
+        cmd_vel.angular.z = std::max(sub_yaw_error_, -max_yawrate_);
+        RCLCPP_INFO(
+          this->get_logger(), "Align Right VFH velocity: speed: %.3f, angular: %.3f",
+          cmd_vel.linear.x, cmd_vel.angular.z);
+      }
+    } else {
+      cmd_vel.linear.x = std::min(sub_goal_distance_, max_velocity_);
       cmd_vel.angular.z = sub_yaw_error_;
       RCLCPP_INFO(
         this->get_logger(), "Move VFH velocity: speed: %.3f, angular: %.3f", cmd_vel.linear.x,
         cmd_vel.angular.z);
-      if (sub_distance_th_ < dist_goal_th_) {
+      if (sub_goal_distance_ < dist_goal_th_) {
         cmd_vel.linear.x = min_velocity_;
         cmd_vel.angular.z = 0.0;
         RCLCPP_INFO(this->get_logger(), "Sub Goal Point Arrived!");
         sub_goal_reached_ = true;
       }
     }
-
-    // if (std::abs(sub_yaw_error_) > angle_goal_th_) {
-    //   cmd_vel.linear.x = 0.0;
-    //   cmd_vel.angular.z = std::min(std::max(sub_yaw_error_, -max_yawrate_), max_yawrate_);
-    //   RCLCPP_INFO(
-    //     this->get_logger(), "Align VFH velocity: speed: %.3f, angular: %.3f", cmd_vel.linear.x,
-    //     cmd_vel.angular.z);
-    // } else {
-    //   cmd_vel.linear.x = max_velocity_;
-    //   cmd_vel.angular.z = 0.0;
-    //   RCLCPP_INFO(
-    //     this->get_logger(), "Move VFH velocity: speed: %.3f, angular: %.3f", cmd_vel.linear.x,
-    //     cmd_vel.angular.z);
-    //   if (sub_distance_th_ < dist_goal_th_) {
-    //     cmd_vel.linear.x = min_velocity_;
-    //     cmd_vel.angular.z = 0.0;
-    //     RCLCPP_INFO(this->get_logger(), "Sub Goal Point Arrived!");
-    //     sub_goal_reached_ = true;
-    //   }
-    // }
-
     return cmd_vel;
   }
 
@@ -268,11 +246,6 @@ public:
 
       double angle = scan_msg_->angle_min + i * scan_msg_->angle_increment;
       int vector_index = static_cast<int>(std::round((angle * 180 / M_PI) + 180));
-      if (vector_index < 0) {
-        vector_index += 360;
-      } else if (vector_index >= 360) {
-        vector_index -= 360;
-      }
       distance_vector[vector_index] = std::min(distance_vector[vector_index], scan_msg_->ranges[i]);
     }
 
@@ -288,26 +261,34 @@ public:
         break;
       }
     }
-
+    RCLCPP_INFO(this->get_logger(), "left index : %d, right_index : %d", left_index_, right_index_);
     best_index_ =
-      (left_index_ <= (distance_vector.size() - 1.0 - right_index_)) ? left_index_ : right_index_;
+      (left_index_ <= right_index_) ? left_index_ : right_index_;
     RCLCPP_INFO(
       this->get_logger(), "Selected direction: %s, Index: %d",
-      (best_index_ == left_index_) ? "Left" : "Right",
-      best_index_);
+      (best_index_ == left_index_) ? "Left" : "Right", best_index_);
 
     sub_goal_angle_ = best_index_ * M_PI / 180.0;
     if (best_index_ == left_index_) {
-      sub_goal_x_ = robot_x_ - sub_goal_distance_ * cos(sub_goal_angle_);
-      sub_goal_y_ = robot_y_ + sub_goal_distance_ * sin(sub_goal_angle_);
+      if (robot_yaw_ + sub_goal_angle_ <= M_PI / 2) {
+        sub_goal_x_ = robot_x_ - sub_goal_th_ * cos(robot_yaw_ + sub_goal_angle_);
+        sub_goal_y_ = robot_y_ + sub_goal_th_ * sin(robot_yaw_ + sub_goal_angle_);
+      } else if (robot_yaw_ + sub_goal_angle_ > M_PI / 2) {
+        sub_goal_x_ = robot_x_ - sub_goal_th_ * cos(M_PI - (robot_yaw_ + sub_goal_angle_));
+        sub_goal_y_ = robot_y_ + sub_goal_th_ * sin(M_PI - (robot_yaw_ + sub_goal_angle_));
+      }
     } else if (best_index_ == right_index_) {
-      sub_goal_x_ = robot_x_ + sub_goal_distance_ * cos(sub_goal_angle_);
-      sub_goal_y_ = robot_y_ + sub_goal_distance_ * sin(sub_goal_angle_);
+      if (robot_yaw_ + sub_goal_angle_ <= M_PI / 2) {
+        sub_goal_x_ = robot_x_ + sub_goal_th_ * cos(robot_yaw_ - sub_goal_angle_);
+        sub_goal_y_ = robot_y_ + sub_goal_th_ * sin(robot_yaw_ - sub_goal_angle_);
+      } else if (robot_yaw_ + sub_goal_angle_ > M_PI / 2) {
+        sub_goal_x_ = robot_x_ - sub_goal_th_ * cos(M_PI - (robot_yaw_ - sub_goal_angle_));
+        sub_goal_y_ = robot_y_ + sub_goal_th_ * sin(M_PI - (robot_yaw_ - sub_goal_angle_));
+      }
     }
 
     sub_goal_.pose.position.x = sub_goal_x_;
     sub_goal_.pose.position.y = sub_goal_y_;
-    sub_goal_.pose.position.z = 0;
 
     tf2::Quaternion q;
     q.setRPY(0, 0, robot_yaw_ + sub_goal_angle_);
@@ -315,6 +296,15 @@ public:
     RCLCPP_INFO(
       this->get_logger(), "Update Sub Goal: x=%.3f, y=%.3f, yaw=%.3f", sub_goal_x_, sub_goal_y_,
       sub_goal_.pose.orientation.w);
+
+    if (best_index_ == left_index_) {
+      sub_target_yaw_ = robot_yaw_ + sub_goal_angle_;
+    } else if (best_index_ == right_index_) {
+      sub_target_yaw_ = robot_yaw_ - sub_goal_angle_;
+    }
+    RCLCPP_INFO(
+      this->get_logger(), "sub_target_yaw: %.3f", sub_target_yaw_);
+
     sub_goal_reached_ = false;
   }
 
@@ -322,23 +312,16 @@ public:
   {
     double sub_diff_x = sub_goal_x_ - robot_x_;
     double sub_diff_y = sub_goal_y_ - robot_y_;
+    sub_goal_distance_ = std::hypot(sub_diff_x, sub_diff_y);
 
-    sub_distance_th_ = std::hypot(sub_diff_x, sub_diff_y);
-    sub_target_angle_ = atan2(sub_diff_x, sub_diff_y);
-    sub_yaw_error_ = robot_yaw_ - sub_target_angle_;
-    RCLCPP_INFO(
-      this->get_logger(), "robot_x: %.3f, robot_y: %.3f, robot_yaw: %.3f", robot_x_, robot_y_,
-      robot_yaw_);
-
-    while (sub_yaw_error_ > M_PI) {sub_yaw_error_ -= 2.0 * M_PI;}
-    while (sub_yaw_error_ < -M_PI) {sub_yaw_error_ += 2.0 * M_PI;}
+    sub_yaw_error_ = sub_target_yaw_ - robot_yaw_;
 
     RCLCPP_INFO(
-      this->get_logger(), "Sub Goal: x=%.3f, y=%.3f, yaw=%.3f", sub_goal_x_, sub_goal_y_,
-      sub_goal_.pose.orientation.w);
+      this->get_logger(), "robot_x: %.3f, robot_y: %.3f, robot_yaw: %.3f",
+      robot_x_, robot_y_, robot_yaw_);
     RCLCPP_INFO(
-      this->get_logger(), "sub_target_yaw: %.3f, sub_yaw_error: %.3f", sub_target_angle_,
-      sub_yaw_error_);
+      this->get_logger(), "sub_goal_distance: %.3f, sub_yaw_error: %.3f",
+      sub_goal_distance_, sub_yaw_error_);
     return sub_yaw_error_;
   }
 
@@ -362,9 +345,9 @@ private:
   bool scan_updated_, robot_reached_, robot_aligned_, sub_goal_reached_;
   double max_velocity_, min_velocity_, max_yawrate_, goal_yaw_;
   double robot_x_, robot_y_, robot_yaw_;
-  double target_yaw_, yaw_error_, sub_target_angle_, sub_yaw_error_;
+  double target_yaw_, yaw_error_, sub_target_angle_, sub_yaw_error_, sub_target_yaw_;
   double dist_goal_th_, angle_goal_th_, emergency_th_, obstacle_th_;
-  double sub_goal_angle_, sub_goal_x_, sub_goal_y_, sub_goal_distance_, sub_distance_th_,
+  double sub_goal_angle_, sub_goal_x_, sub_goal_y_, sub_goal_distance_, sub_goal_th_,
     safety_distance_;
   int best_index_, left_index_, right_index_;
   float robot_bubble_;
