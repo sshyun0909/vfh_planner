@@ -1,2 +1,2 @@
 # vfh_planner
-vfh planner
+omo_robot_r1 vfh planner
